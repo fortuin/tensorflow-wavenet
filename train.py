@@ -199,117 +199,118 @@ def main():
     with open(args.wavenet_params, 'r') as f:
         wavenet_params = json.load(f)
 
-    # Create coordinator.
-    coord = tf.train.Coordinator()
+    with tf.device('/gpu:0'):
+        # Create coordinator.
+        coord = tf.train.Coordinator()
 
-    # Load raw waveform from VCTK corpus.
-    with tf.name_scope('create_inputs'):
-        # Allow silence trimming to be skipped by specifying a threshold near
-        # zero.
-        silence_threshold = args.silence_threshold if args.silence_threshold > \
-                                                      EPSILON else None
-        reader = AudioReader(
-            args.data_dir,
-            coord,
-            sample_rate=wavenet_params['sample_rate'],
-            sample_size=args.sample_size,
-            silence_threshold=args.silence_threshold)
-        audio_batch = reader.dequeue(args.batch_size)
+        # Load raw waveform from VCTK corpus.
+        with tf.name_scope('create_inputs'):
+            # Allow silence trimming to be skipped by specifying a threshold near
+            # zero.
+            silence_threshold = args.silence_threshold if args.silence_threshold > \
+                                                          EPSILON else None
+            reader = AudioReader(
+                args.data_dir,
+                coord,
+                sample_rate=wavenet_params['sample_rate'],
+                sample_size=args.sample_size,
+                silence_threshold=args.silence_threshold)
+            audio_batch = reader.dequeue(args.batch_size)
 
-    # Create network.
-    net = WaveNetModel(
-        batch_size=args.batch_size,
-        dilations=wavenet_params["dilations"],
-        filter_width=wavenet_params["filter_width"],
-        residual_channels=wavenet_params["residual_channels"],
-        dilation_channels=wavenet_params["dilation_channels"],
-        skip_channels=wavenet_params["skip_channels"],
-        quantization_channels=wavenet_params["quantization_channels"],
-        use_biases=wavenet_params["use_biases"],
-        scalar_input=wavenet_params["scalar_input"],
-        initial_filter_width=wavenet_params["initial_filter_width"],
-        histograms=args.histograms)
-    if args.l2_regularization_strength == 0:
-        args.l2_regularization_strength = None
-    loss = net.loss(audio_batch, args.l2_regularization_strength)
-    optimizer = optimizer_factory[args.optimizer](
-                    learning_rate=args.learning_rate,
-                    momentum=args.momentum)
-    trainable = tf.trainable_variables()
-    optim = optimizer.minimize(loss, var_list=trainable)
+        # Create network.
+        net = WaveNetModel(
+            batch_size=args.batch_size,
+            dilations=wavenet_params["dilations"],
+            filter_width=wavenet_params["filter_width"],
+            residual_channels=wavenet_params["residual_channels"],
+            dilation_channels=wavenet_params["dilation_channels"],
+            skip_channels=wavenet_params["skip_channels"],
+            quantization_channels=wavenet_params["quantization_channels"],
+            use_biases=wavenet_params["use_biases"],
+            scalar_input=wavenet_params["scalar_input"],
+            initial_filter_width=wavenet_params["initial_filter_width"],
+            histograms=args.histograms)
+        if args.l2_regularization_strength == 0:
+            args.l2_regularization_strength = None
+        loss = net.loss(audio_batch, args.l2_regularization_strength)
+        optimizer = optimizer_factory[args.optimizer](
+                        learning_rate=args.learning_rate,
+                        momentum=args.momentum)
+        trainable = tf.trainable_variables()
+        optim = optimizer.minimize(loss, var_list=trainable)
 
-    # Set up logging for TensorBoard.
-    writer = tf.train.SummaryWriter(logdir)
-    writer.add_graph(tf.get_default_graph())
-    run_metadata = tf.RunMetadata()
-    summaries = tf.merge_all_summaries()
+        # Set up logging for TensorBoard.
+        writer = tf.train.SummaryWriter(logdir)
+        writer.add_graph(tf.get_default_graph())
+        run_metadata = tf.RunMetadata()
+        summaries = tf.merge_all_summaries()
 
-    # Set up session
-    sess = tf.Session(config=tf.ConfigProto(log_device_placement=True))
-    init = tf.initialize_all_variables()
-    sess.run(init)
+        # Set up session
+        sess = tf.Session(config=tf.ConfigProto(log_device_placement=True))
+        init = tf.initialize_all_variables()
+        sess.run(init)
 
-    # Saver for storing checkpoints of the model.
-    saver = tf.train.Saver(var_list=tf.trainable_variables())
+        # Saver for storing checkpoints of the model.
+        saver = tf.train.Saver(var_list=tf.trainable_variables())
 
-    try:
-        saved_global_step = load(saver, sess, restore_from)
-        if is_overwritten_training or saved_global_step is None:
-            # The first training step will be saved_global_step + 1,
-            # therefore we put -1 here for new or overwritten trainings.
-            saved_global_step = -1
+        try:
+            saved_global_step = load(saver, sess, restore_from)
+            if is_overwritten_training or saved_global_step is None:
+                # The first training step will be saved_global_step + 1,
+                # therefore we put -1 here for new or overwritten trainings.
+                saved_global_step = -1
 
-    except:
-        print("Something went wrong while restoring checkpoint. "
-              "We will terminate training to avoid accidentally overwriting "
-              "the previous model.")
-        raise
+        except:
+            print("Something went wrong while restoring checkpoint. "
+                  "We will terminate training to avoid accidentally overwriting "
+                  "the previous model.")
+            raise
 
-    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
-    reader.start_threads(sess)
+        threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+        reader.start_threads(sess)
 
-    step = None
-    try:
-        last_saved_step = saved_global_step
-        for step in range(saved_global_step + 1, args.num_steps):
-            start_time = time.time()
-            if args.store_metadata and step % 50 == 0:
-                # Slow run that stores extra information for debugging.
-                print('Storing metadata')
-                run_options = tf.RunOptions(
-                    trace_level=tf.RunOptions.FULL_TRACE)
-                summary, loss_value, _ = sess.run(
-                    [summaries, loss, optim],
-                    options=run_options,
-                    run_metadata=run_metadata)
-                writer.add_summary(summary, step)
-                writer.add_run_metadata(run_metadata,
-                                        'step_{:04d}'.format(step))
-                tl = timeline.Timeline(run_metadata.step_stats)
-                timeline_path = os.path.join(logdir, 'timeline.trace')
-                with open(timeline_path, 'w') as f:
-                    f.write(tl.generate_chrome_trace_format(show_memory=True))
-            else:
-                summary, loss_value, _ = sess.run([summaries, loss, optim])
-                writer.add_summary(summary, step)
+        step = None
+        try:
+            last_saved_step = saved_global_step
+            for step in range(saved_global_step + 1, args.num_steps):
+                start_time = time.time()
+                if args.store_metadata and step % 50 == 0:
+                    # Slow run that stores extra information for debugging.
+                    print('Storing metadata')
+                    run_options = tf.RunOptions(
+                        trace_level=tf.RunOptions.FULL_TRACE)
+                    summary, loss_value, _ = sess.run(
+                        [summaries, loss, optim],
+                        options=run_options,
+                        run_metadata=run_metadata)
+                    writer.add_summary(summary, step)
+                    writer.add_run_metadata(run_metadata,
+                                            'step_{:04d}'.format(step))
+                    tl = timeline.Timeline(run_metadata.step_stats)
+                    timeline_path = os.path.join(logdir, 'timeline.trace')
+                    with open(timeline_path, 'w') as f:
+                        f.write(tl.generate_chrome_trace_format(show_memory=True))
+                else:
+                    summary, loss_value, _ = sess.run([summaries, loss, optim])
+                    writer.add_summary(summary, step)
 
-            duration = time.time() - start_time
-            print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
-                  .format(step, loss_value, duration))
+                duration = time.time() - start_time
+                print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
+                      .format(step, loss_value, duration))
 
-            if step % args.checkpoint_every == 0:
+                if step % args.checkpoint_every == 0:
+                    save(saver, sess, logdir, step)
+                    last_saved_step = step
+
+        except KeyboardInterrupt:
+            # Introduce a line break after ^C is displayed so save message
+            # is on its own line.
+            print()
+        finally:
+            if step > last_saved_step:
                 save(saver, sess, logdir, step)
-                last_saved_step = step
-
-    except KeyboardInterrupt:
-        # Introduce a line break after ^C is displayed so save message
-        # is on its own line.
-        print()
-    finally:
-        if step > last_saved_step:
-            save(saver, sess, logdir, step)
-        coord.request_stop()
-        coord.join(threads)
+            coord.request_stop()
+            coord.join(threads)
 
 
 if __name__ == '__main__':
