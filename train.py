@@ -245,7 +245,7 @@ def main():
     summaries = tf.merge_all_summaries()
 
     # Set up session
-    sess = tf.Session(config=tf.ConfigProto(log_device_placement=False))
+    sess = tf.Session(config=tf.ConfigProto(log_device_placement=True))
     init = tf.initialize_all_variables()
     sess.run(init)
 
